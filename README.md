@@ -1,3 +1,11 @@
+**English** | [简体中文](README_zh-CN.md)
+
+> [!NOTE]
+> This repository is a fork of scrcpy with additional camera-preview controls.
+> The official upstream repository and downloads do not include these fork-specific
+> controls. See the [Chinese guide](README_zh-CN.md) for the customized Windows
+> camera preview and usage instructions.
+
 > [!WARNING]
 > **This GitHub repo (<https://github.com/Genymobile/scrcpy>) is the only official
 source for the project. Do not download releases from random websites, even if
