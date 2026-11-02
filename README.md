@@ -6,6 +6,8 @@
 > controls. See the [Chinese guide](README_zh-CN.md) for the customized Windows
 > camera preview and usage instructions.
 
+**Windows camera preview:** [Download the latest portable package](https://github.com/keanuCN/scrcpy/releases/latest). Extract the entire archive and launch `虚拟摄像头.exe`. This is a preview application and does not register a Windows virtual camera device.
+
 > [!WARNING]
 > **This GitHub repo (<https://github.com/Genymobile/scrcpy>) is the only official
 source for the project. Do not download releases from random websites, even if
