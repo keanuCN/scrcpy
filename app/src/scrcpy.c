@@ -109,10 +109,16 @@ static BOOL WINAPI windows_ctrl_handler(DWORD ctrl_type) {
 
 static void
 sdl_configure_ctrl_c_windows(void) {
+    static bool configured;
+    if (configured) {
+        return;
+    }
     // Clean up properly on Ctrl+C on Windows
     bool ok = SetConsoleCtrlHandler(windows_ctrl_handler, TRUE);
     if (!ok) {
         LOGW("Could not set Ctrl+C handler");
+    } else {
+        configured = true;
     }
 }
 #endif // _WIN32
@@ -147,6 +153,9 @@ event_loop(struct scrcpy *s, bool has_screen) {
                 LOGI("Time limit reached");
                 return SCRCPY_EXIT_SUCCESS;
             case SDL_EVENT_QUIT:
+                if (has_screen && s->screen.camera_switch_requested) {
+                    return SCRCPY_EXIT_SWITCH_CAMERA;
+                }
                 LOGD("User requested to quit");
                 return SCRCPY_EXIT_SUCCESS;
             default:
@@ -388,7 +397,11 @@ scrcpy(struct scrcpy_options *options) {
         return SCRCPY_EXIT_FAILURE;
     }
 
-    atexit(SDL_Quit);
+    static bool sdl_quit_registered;
+    if (!sdl_quit_registered) {
+        atexit(SDL_Quit);
+        sdl_quit_registered = true;
+    }
 
     enum scrcpy_exit_code ret = SCRCPY_EXIT_FAILURE;
 
@@ -570,8 +583,9 @@ scrcpy(struct scrcpy_options *options) {
     // It is necessarily initialized here, since the device is connected
     struct sc_server_info *info = &s->server.info;
 
-    const char *window_title =
-        options->window_title ? options->window_title : info->device_name;
+    const char *window_title = options->window_title ? options->window_title
+        : options->video_source == SC_VIDEO_SOURCE_CAMERA
+            ? "\u865a\u62df\u6444\u50cf\u5934" : info->device_name;
     assert(window_title);
 
     if (options->update_terminal_title) {
@@ -816,6 +830,10 @@ aoa_complete:
         struct sc_screen_params screen_params = {
             .video = options->video_playback,
             .camera = options->video_source == SC_VIDEO_SOURCE_CAMERA,
+            .camera_switchable = options->video_source == SC_VIDEO_SOURCE_CAMERA
+                              && !options->camera_id
+                              && options->camera_facing != SC_CAMERA_FACING_EXTERNAL
+                              && !options->record_filename,
             .flex_display = options->flex_display,
             .controller = controller,
             .fp = fp,
@@ -1037,6 +1055,28 @@ aoa_complete:
     }
 
     ret = event_loop(s, options->window);
+
+    if (ret == SCRCPY_EXIT_SWITCH_CAMERA) {
+        struct sc_screen *screen = &s->screen;
+        bool fullscreen = (SDL_GetWindowFlags(screen->window)
+                           & SDL_WINDOW_FULLSCREEN) != 0;
+        int x, y, width, height;
+        if (fullscreen && screen->windowed_geometry_valid) {
+            x = screen->windowed_x;
+            y = screen->windowed_y;
+            width = screen->windowed_width;
+            height = screen->windowed_height;
+        } else {
+            SDL_GetWindowPosition(screen->window, &x, &y);
+            SDL_GetWindowSize(screen->window, &width, &height);
+        }
+        options->window_x = x;
+        options->window_y = y;
+        options->window_width = width;
+        options->window_height = height;
+        options->fullscreen = fullscreen;
+        options->display_orientation = screen->orientation;
+    }
 
     // Reject all new runnables, and execute the pending ones now
     // (they could access memory that will be cleaned up below)

@@ -37,6 +37,13 @@ struct sc_screen {
 
     bool video;
     bool camera;
+    bool camera_switchable;
+    bool camera_switch_requested;
+    bool screenshot_requested;
+    bool windowed_geometry_valid;
+    int windowed_x, windowed_y, windowed_width, windowed_height;
+    SDL_Texture *camera_toolbar;
+    int camera_toolbar_hover;
     bool window_aspect_ratio_lock;
     bool flex_display;
 
@@ -116,6 +123,7 @@ struct sc_screen {
 struct sc_screen_params {
     bool video;
     bool camera;
+    bool camera_switchable;
     bool flex_display;
 
     struct sc_controller *controller;

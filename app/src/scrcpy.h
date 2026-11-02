@@ -14,6 +14,9 @@ enum scrcpy_exit_code {
 
     // Device was disconnected while running
     SCRCPY_EXIT_DISCONNECTED,
+
+    // Internal request to restart the camera session with the other lens.
+    SCRCPY_EXIT_SWITCH_CAMERA,
 };
 
 enum scrcpy_exit_code

@@ -89,18 +89,32 @@ main_scrcpy(int argc, char *argv[]) {
 
     sc_log_configure();
 
-    if (!sc_main_thread_init()) {
-        ret = SCRCPY_EXIT_FAILURE;
-        goto net_cleanup;
+    // A camera switch fully tears down the previous session before reconnecting.
+    // Make the initial default deterministic so that the opposite lens is known.
+    if (args.opts.video_source == SC_VIDEO_SOURCE_CAMERA
+            && !args.opts.camera_id
+            && args.opts.window
+            && !args.opts.record_filename
+            && args.opts.camera_facing == SC_CAMERA_FACING_ANY) {
+        args.opts.camera_facing = SC_CAMERA_FACING_BACK;
     }
-
+    do {
+        if (!sc_main_thread_init()) {
+            ret = SCRCPY_EXIT_FAILURE;
+            goto net_cleanup;
+        }
 #ifdef HAVE_USB
-    ret = args.opts.otg ? scrcpy_otg(&args.opts) : scrcpy(&args.opts);
+        ret = args.opts.otg ? scrcpy_otg(&args.opts) : scrcpy(&args.opts);
 #else
-    ret = scrcpy(&args.opts);
+        ret = scrcpy(&args.opts);
 #endif
-
-    sc_main_thread_destroy();
+        sc_main_thread_destroy();
+        if (ret == SCRCPY_EXIT_SWITCH_CAMERA) {
+            args.opts.camera_facing = args.opts.camera_facing == SC_CAMERA_FACING_FRONT
+                                    ? SC_CAMERA_FACING_BACK : SC_CAMERA_FACING_FRONT;
+            SDL_Quit();
+        }
+    } while (ret == SCRCPY_EXIT_SWITCH_CAMERA);
 
 net_cleanup:
     net_cleanup();

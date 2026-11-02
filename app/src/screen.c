@@ -1,8 +1,15 @@
 #include "screen.h"
 
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <SDL3/SDL.h>
+
+#ifdef _WIN32
+# include <winsock2.h>
+# include <windows.h>
+#endif
 
 #include "events.h"
 #include "icon.h"
@@ -13,6 +20,94 @@
 #define DISPLAY_MARGINS 96
 
 #define DOWNCAST(SINK) container_of(SINK, struct sc_screen, frame_sink)
+
+#define CAMERA_BAR_X 12
+#define CAMERA_BAR_Y 12
+#define CAMERA_BUTTON_W 96
+#define CAMERA_BUTTON_H 46
+#define CAMERA_BUTTON_COUNT 5
+
+#ifdef _WIN32
+// Rasterize the toolbar once with a Windows Unicode font, then render it as a
+// texture. SDL's built-in debug font cannot display Chinese glyphs.
+static SDL_Texture *
+create_camera_toolbar(struct sc_screen *screen) {
+    const int width = CAMERA_BUTTON_W * CAMERA_BUTTON_COUNT;
+    const int height = CAMERA_BUTTON_H;
+    BITMAPINFO info = {0};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void *pixels = NULL;
+    HDC dc = CreateCompatibleDC(NULL);
+    if (!dc) return NULL;
+    HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &pixels, NULL, 0);
+    if (!bitmap) { DeleteDC(dc); return NULL; }
+    HGDIOBJ old_bitmap = SelectObject(dc, bitmap);
+    memset(pixels, 0, width * height * 4);
+    HFONT font = CreateFontW(-15, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
+    HGDIOBJ old_font = font ? SelectObject(dc, font) : NULL;
+    HBRUSH tray = CreateSolidBrush(RGB(19, 28, 37));
+    HPEN border = CreatePen(PS_SOLID, 1, RGB(62, 80, 91));
+    HGDIOBJ old_brush = SelectObject(dc, tray);
+    HGDIOBJ old_pen = SelectObject(dc, border);
+    RoundRect(dc, 0, 0, width, height, 16, 16);
+    SetBkMode(dc, TRANSPARENT);
+    const wchar_t *labels[] = {L"\u5207\u6362\u6444\u50cf\u5934", L"\u955c\u50cf", L"\u65cb\u8f6c", L"\u5168\u5c4f", L"\u622a\u56fe"};
+    for (int i = 0; i < CAMERA_BUTTON_COUNT; ++i) {
+        bool selected = i == 1 && sc_orientation_is_mirror(screen->orientation);
+        bool disabled = i == 0 && !screen->camera_switchable;
+        COLORREF color = disabled ? RGB(28, 39, 47)
+                       : i == screen->camera_toolbar_hover ? RGB(52, 90, 97)
+                       : selected ? RGB(31, 100, 95) : RGB(38, 52, 61);
+        HBRUSH button_brush = CreateSolidBrush(color);
+        HPEN button_pen = CreatePen(PS_SOLID, 1, selected ? RGB(93, 198, 177) : RGB(58, 77, 85));
+        SelectObject(dc, button_brush);
+        SelectObject(dc, button_pen);
+        int left = i * CAMERA_BUTTON_W + 4;
+        RoundRect(dc, left, 4, (i + 1) * CAMERA_BUTTON_W - 4, height - 4, 12, 12);
+        SelectObject(dc, tray);
+        SelectObject(dc, border);
+        DeleteObject(button_brush);
+        DeleteObject(button_pen);
+        SetTextColor(dc, disabled ? RGB(135, 151, 154) : RGB(242, 248, 247));
+        RECT rect = {left, 4, (i + 1) * CAMERA_BUTTON_W - 4, height - 4};
+        DrawTextW(dc, labels[i], -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    unsigned char *bytes = pixels;
+    for (int i = 0; i < width * height; ++i) {
+        bytes[i * 4 + 3] = (bytes[i * 4] || bytes[i * 4 + 1] || bytes[i * 4 + 2]) ? 255 : 0;
+    }
+    SDL_Surface *surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_BGRA32, pixels, width * 4);
+    SDL_Texture *texture = surface ? SDL_CreateTextureFromSurface(screen->renderer, surface) : NULL;
+    if (surface) SDL_DestroySurface(surface);
+    if (old_font) SelectObject(dc, old_font);
+    if (font) DeleteObject(font);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(tray);
+    DeleteObject(border);
+    SelectObject(dc, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    return texture;
+}
+#endif
+
+static float
+camera_bar_scale(struct sc_screen *screen) {
+    int width, height;
+    SDL_GetWindowSize(screen->window, &width, &height);
+    (void) height;
+    float available = (float) (width - 2 * CAMERA_BAR_X);
+    float scale = available / (CAMERA_BUTTON_W * CAMERA_BUTTON_COUNT);
+    return scale < 1 ? SDL_max(scale, 0.1f) : 1;
+}
 
 static void
 set_aspect_ratio(struct sc_screen *screen, struct sc_size content_size) {
@@ -340,6 +435,54 @@ sc_screen_render(struct sc_screen *screen, bool update_content_rect) {
     }
 
 end:
+    if (screen->screenshot_requested) {
+        screen->screenshot_requested = false;
+        SDL_Surface *shot = SDL_RenderReadPixels(renderer, NULL);
+        const char *folder = SDL_GetUserFolder(SDL_FOLDER_PICTURES);
+        if (!folder) folder = SDL_GetBasePath();
+        char path[4096];
+        time_t now = time(NULL);
+        struct tm *local = localtime(&now);
+        if (shot && folder && local) {
+            SDL_snprintf(path, sizeof(path), "%sscrcpy-%04d%02d%02d-%02d%02d%02d-%03" SDL_PRIu64 ".bmp",
+                         folder, local->tm_year + 1900, local->tm_mon + 1,
+                         local->tm_mday, local->tm_hour, local->tm_min,
+                         local->tm_sec, SDL_GetTicks() % 1000);
+            if (SDL_SaveBMP(shot, path)) {
+                LOGI("Screenshot saved: %s", path);
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "scrcpy", path, screen->window);
+            } else {
+                LOGE("Could not save screenshot: %s", SDL_GetError());
+            }
+        } else {
+            LOGE("Could not capture screenshot: %s", SDL_GetError());
+        }
+        if (shot) SDL_DestroySurface(shot);
+    }
+    if (screen->camera && !screen->disconnected) {
+        float density = SDL_GetWindowPixelDensity(screen->window);
+        if (density <= 0) {
+            density = 1;
+        }
+        float scale = camera_bar_scale(screen);
+        SDL_FRect bar = { CAMERA_BAR_X * density, CAMERA_BAR_Y * density,
+                          CAMERA_BUTTON_W * CAMERA_BUTTON_COUNT * scale * density,
+                          CAMERA_BUTTON_H * scale * density };
+#ifdef _WIN32
+        if (!screen->camera_toolbar) screen->camera_toolbar = create_camera_toolbar(screen);
+        if (screen->camera_toolbar) SDL_RenderTexture(renderer, screen->camera_toolbar, NULL, &bar);
+#else
+        SDL_SetRenderDrawColor(renderer, 31, 39, 49, 255);
+        SDL_RenderFillRect(renderer, &bar);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+        SDL_SetRenderScale(renderer, density * scale, density * scale);
+        const char *labels[] = {"Switch", "Mirror", "Rotate", "Fullscreen", "Screenshot"};
+        for (int i = 0; i < CAMERA_BUTTON_COUNT; ++i)
+            SDL_RenderDebugText(renderer, CAMERA_BAR_X / scale + i * CAMERA_BUTTON_W + 5,
+                                CAMERA_BAR_Y / scale + 13, labels[i]);
+        SDL_SetRenderScale(renderer, 1, 1);
+#endif
+    }
     sc_sdl_render_present(renderer);
 }
 
@@ -529,7 +672,15 @@ sc_screen_init(struct sc_screen *screen,
 
     screen->video = params->video;
     screen->camera = params->camera;
-    screen->window_aspect_ratio_lock = params->window_aspect_ratio_lock;
+    screen->camera_switchable = params->camera_switchable;
+    screen->camera_switch_requested = false;
+    screen->screenshot_requested = false;
+    screen->camera_toolbar = NULL;
+    screen->camera_toolbar_hover = -1;
+    screen->windowed_geometry_valid = false;
+    // Camera frames may have different aspect ratios. Letterbox them inside
+    // the existing window instead of letting the OS resize it on a switch.
+    screen->window_aspect_ratio_lock = params->window_aspect_ratio_lock && !params->camera;
     screen->render_fit = params->render_fit;
     screen->flex_display = params->flex_display;
 
@@ -750,6 +901,7 @@ sc_screen_init(struct sc_screen *screen,
 
 error_destroy_texture:
     sc_texture_destroy(&screen->tex);
+    if (screen->camera_toolbar) SDL_DestroyTexture(screen->camera_toolbar);
 error_destroy_renderer:
 #ifdef SC_DISPLAY_FORCE_OPENGL_CORE_PROFILE
     if (screen->gl_context) {
@@ -845,6 +997,7 @@ sc_screen_destroy(struct sc_screen *screen) {
         sc_disconnect_destroy(&screen->disconnect);
     }
     sc_texture_destroy(&screen->tex);
+    if (screen->camera_toolbar) SDL_DestroyTexture(screen->camera_toolbar);
     av_frame_free(&screen->frame);
 #ifdef SC_DISPLAY_FORCE_OPENGL_CORE_PROFILE
     SDL_GL_DestroyContext(screen->gl_context);
@@ -941,7 +1094,7 @@ sc_screen_set_orientation(struct sc_screen *screen,
     struct sc_size new_content_size =
         get_oriented_size(screen->frame_size, orientation);
 
-    set_content_size(screen, new_content_size, true);
+    set_content_size(screen, new_content_size, !screen->camera);
 
     screen->orientation = orientation;
     LOGI("Display orientation set to %s", sc_orientation_get_name(orientation));
@@ -978,7 +1131,7 @@ sc_screen_apply_frame(struct sc_screen *screen, bool can_resize) {
             sc_screen_track_resize(screen, new_content_size);
         }
 
-        set_content_size(screen, new_content_size, can_resize);
+        set_content_size(screen, new_content_size, can_resize && !screen->camera);
         sc_screen_update_content_rect(screen);
     }
 
@@ -1058,6 +1211,12 @@ sc_screen_toggle_fullscreen(struct sc_screen *screen) {
 
     bool req_fullscreen =
         !(SDL_GetWindowFlags(screen->window) & SDL_WINDOW_FULLSCREEN);
+
+    if (screen->camera && req_fullscreen) {
+        SDL_GetWindowPosition(screen->window, &screen->windowed_x, &screen->windowed_y);
+        SDL_GetWindowSize(screen->window, &screen->windowed_width, &screen->windowed_height);
+        screen->windowed_geometry_valid = true;
+    }
 
     bool ok = SDL_SetWindowFullscreen(screen->window, req_fullscreen);
     if (!ok) {
@@ -1170,6 +1329,59 @@ sc_disconnect_on_timeout(struct sc_disconnect *d, void *userdata) {
 
 void
 sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
+    float bar_scale = screen->camera ? camera_bar_scale(screen) : 1;
+    if (screen->camera && screen->window_shown
+            && (event->type == SDL_EVENT_MOUSE_MOTION
+                || event->type == SDL_EVENT_WINDOW_MOUSE_LEAVE)) {
+        int hover = -1;
+        if (event->type == SDL_EVENT_MOUSE_MOTION
+                && event->motion.x >= CAMERA_BAR_X
+                && event->motion.x < CAMERA_BAR_X + CAMERA_BUTTON_W * CAMERA_BUTTON_COUNT * bar_scale
+                && event->motion.y >= CAMERA_BAR_Y
+                && event->motion.y < CAMERA_BAR_Y + CAMERA_BUTTON_H * bar_scale) {
+            hover = (event->motion.x - CAMERA_BAR_X) / (CAMERA_BUTTON_W * bar_scale);
+        }
+        if (hover != screen->camera_toolbar_hover) {
+            screen->camera_toolbar_hover = hover;
+            if (screen->camera_toolbar) SDL_DestroyTexture(screen->camera_toolbar);
+            screen->camera_toolbar = NULL;
+            sc_screen_render(screen, false);
+        }
+    }
+    if (screen->camera && !screen->disconnected
+            && event->type == SDL_EVENT_MOUSE_BUTTON_DOWN
+            && event->button.button == SDL_BUTTON_LEFT
+            && event->button.x >= CAMERA_BAR_X
+            && event->button.x < CAMERA_BAR_X + CAMERA_BUTTON_W * CAMERA_BUTTON_COUNT * bar_scale
+            && event->button.y >= CAMERA_BAR_Y
+            && event->button.y < CAMERA_BAR_Y + CAMERA_BUTTON_H * bar_scale) {
+        int button = (event->button.x - CAMERA_BAR_X) / (CAMERA_BUTTON_W * bar_scale);
+        switch (button) {
+            case 0:
+                if (screen->camera_switchable) {
+                    screen->camera_switch_requested = true;
+                    sc_push_event(SDL_EVENT_QUIT);
+                }
+                break;
+            case 1:
+                sc_screen_set_orientation(screen, sc_orientation_apply(screen->orientation, SC_ORIENTATION_FLIP_0));
+                if (screen->camera_toolbar) SDL_DestroyTexture(screen->camera_toolbar);
+                screen->camera_toolbar = NULL;
+                sc_screen_render(screen, false);
+                break;
+            case 2:
+                sc_screen_set_orientation(screen, sc_orientation_apply(screen->orientation, SC_ORIENTATION_90));
+                break;
+            case 3:
+                sc_screen_toggle_fullscreen(screen);
+                break;
+            case 4:
+                screen->screenshot_requested = true;
+                sc_screen_render(screen, false);
+                break;
+        }
+        return;
+    }
     switch (event->type) {
         case SC_EVENT_OPEN_WINDOW: {
             struct sc_size *size = event->user.data1;
